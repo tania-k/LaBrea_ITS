@@ -1,0 +1,1187 @@
+---
+title: "R analysis of LaBrea and Boyd Deep Samples"
+author: "Tania Kurbessoian, adapted from Cassandra Ettinger"
+#output:  github_document
+output: pdf
+---
+
+#Pilot LaBrea Samples + Boyd Deep Samples
+
+<u> Overarching Aims: </u>
+(1) Abundance: Which fungi are the most abundant in these samples
+(2) Black Yeast Abundance: Which BY are the most abundant in each sample.
+(3) Diversity: What is the diversity of fungi/BY found in these samples.
+(4) Compare: Comparing both Boyd Deep and Joshua Tree + White Sands Biological Soil Crusts to see
+
+Data generated following: https://docs.google.com/document/d/1DR38FcbGV-cJz0nvYA7TZQSHN1hRTW9Y8MF4LB0YDrE/edit?usp=sharing
+
+Metadata and planning doc: https://docs.google.com/spreadsheets/d/185IY8GIwLPv4x6zx7GHAkHGg7Y0ojJ1bv2O1PNqqLnc/edit#gid=0
+
+```{R}
+#Setup RMarkdown doc; not included in knit
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Loading packages and setting up the analysis
+
+First, load in the R packages that will be used and make note of their versions.
+
+```{r load, message = FALSE, warning=FALSE}
+
+library(ggplot2)
+library(vegan)
+library(phyloseq)
+library(RColorBrewer)
+library(coin)
+library(knitr)
+library(rmarkdown)
+library(FSA)
+library(reshape)
+library(betapart)
+library(dada2)
+library(tidyverse) 
+library(magrittr) 
+library(ShortRead)
+library(ade4)
+library(DESeq2)
+library(viridis)
+library(patchwork)
+library(decontam)
+library(microbiome)
+
+#Get R package references
+#sink("test.bib")
+#out <- sapply(names(sessionInfo()$otherPkgs),function(x) print(citation(x), style = "Bibtex"))
+
+#print the session info - includes computer version, R version and package versions
+sessionInfo()
+```
+Defining a standard error function for use when plotting 
+
+```{R}
+se <- function(x) sqrt(var(x)/length(x))
+```
+
+Going to set the "seed", this ensures any randomization always happens the same way when this analysis is re-run 
+
+```{R}
+set.seed(5271)
+```
+
+### Optional: Use fastQC to look at sequence quality
+Since we will look at quality within DADA2 this is an optional step - if you are having trouble with removing primers - it may be because read-quality is low and so may be worth checking here.
+
+## Remove primers from our sequences 
+
+We used the following primer set: 
+
+### Earth Microbiome Project (EMP) ITS1F-ITS2 primers
+
+<b>R1 forwared primer ITS1F</b>
+TTGGTCATTTAGAGGAAGTAAAAGTCGTAACAAGGTTTCC
+
+<b>R2 reverse primer ITS2</b>
+CGTTCTTCATCGATGCVAGARCCAAGAGATC
+
+### Before using R I have removed primers as follows:
+
+#primers needed to be reverse complemented & R1 & R2 are reversed 
+#can link the primers too if you expect both primers in the read based on length - but first will see how unlinked goes as we used 250 bp seq and may not have both in our reads 
+
+#Run this on the cluster!
+
+for read in $(cat LBTP2.txt);
+do cutadapt -a GATCTCTTGGYTCTBGCATCGATGAAGAACG -A GGAAACCTTGTTACGACTTTTACTTCCTCTAAATGACCAA --match-read-wildcards  -o $read'_R1.noprimers.fastq.gz' -p $read'_R2.noprimers.fastq.gz' $read'_R1_001.fastq.gz' $read'_R2_001.fastq.gz' >> log.txt ;
+done
+
+
+### Optional: ITSx-express 
+Some use ITSx / ITSx-express to remove the 5.8S region/LSU/SSU regions and ITSx-express now maintains quality info which is important because DADA2 needs this information to work correctly https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6206612/ 
+
+However, based on the results of Pauvert et al (2019), I am not going to use ITSx / ITSx-express here when using DADA2 as some evidence from their work that best results are from minimal filtering without ITS extraction. https://doi.org/10.1016/j.funeco.2019.03.005
+
+I will note that as will many choices in the microbiome/mycobiome field - there are studies for and against - I have on my own data compared results using and not using ITSx and have found that it's not great with identifying ITS sequences from early diverging fungal lineages. It also will not work well if you have poor quality sequence data. 
+
+## Running DADA2 
+This general workflow will follow along with the DADA2 provided big-data tutorial https://benjjneb.github.io/dada2/bigdata_paired.html and further will be most similar in spirit to the tutorials by AstroBioMike https://astrobiomike.github.io/amplicon/dada2_workflow_ex
+
+### Choices! Choices! Choices! 
+(a) Analyze one or both reads? - since the F read usually is better quality, many studies now are chucking the R read. This will be a study-dependent, data-dependent choice. Keeping the reverse read allows for longer sequences which may/may not lead to improved taxonomic assignment against the database of choice. However, if the R read quality is too poor it can mean that merging of reads if full of errors or that many F/R pairs are thrown away unnecessarily. If you have looked at your read quality prior to DADA2 (using fastQC perhaps) - maybe you have an idea of what you want to do - if not you can look at quality in DADA2 and decide - or just try both and compare ! 
+
+(b) Max error - DADA2 uses an error model to look at read quality. The default suggestion is to use quality threshold of a max error of 2 - but this is data dependent and can be loosened. I would suggest starting with 2 and then running through the pipeline - how many reads do you have at the end? If you are losing way to many reads due to errors - why? Maybe re-visit (a) or (c) choices - maybe your data is just a bit more error-filled and so loosening to an error of 3 (or ++) is needed here. 
+
+(c) Truncation - truncLen - Lots of times the end of the read is junk. You will want to trim this end bit off usually. For bacterial 16S, you might trim 300 PE reads to (280, 250) etc - since F reads are usually higher quality that first read will be truncate less. For ITS - there is length variability so if you are using both F & R reads and want them to merge - suggestion is to not truncate unless you have to. Also remember read orientation when doing this as truncLen is from end of read (is this the start or end of your amplicon?).   
+
+## What to do?
+Here I know that the read-quality of the F is better than the R so I will try first to analyze paired reads with no truncation & then I will repeat with F only reads with some truncation and compare how many reads make it to end of analysis and how many ASVs are generated. Then I will pick the "best" way forward. Note that "best" is always an arbitrary choice - but generally we are looking for which analysis will allow us to move forward with most high-quality data. One could take it all the way through to analysis and also look at taxonomy to see how this choice will effect downstream results too.  
+
+### DADA2 using both reads 
+```{R}
+
+#Path to data
+raw_data <- "/rhome/tkurb001/shared/projects/LaBrea_Data/data/primer_removed"
+list.files(raw_data)
+
+#Sort and get sample names
+fnFs <- sort(list.files(raw_data, pattern="R1.noprimers.fastq.gz"))
+fnRs <- sort(list.files(raw_data, pattern="R2.noprimers.fastq.gz"))
+sample.names <- sapply(strsplit(fnFs, "_ITS"), `[`, 1)
+
+#specify full paths to the data
+fnFs <- file.path(raw_data, fnFs)
+fnRs <- file.path(raw_data, fnRs)
+
+#Inspecting quality of data
+#plotQualityProfile(fnFs[1:6]) #fwd reads for first 6 samples
+#ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Plot_Raw_QualityProfile.fnFs.png', plot = plotQualityProfile(fnFs[1:6]), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#plotQualityProfile(fnRs[1:6]) #reverse reads for first 6 samples
+#ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Plot_Raw_QualityProfile.fnRs.png', plot = plotQualityProfile(fnRs[1:6]), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#specify where to save filtered data that we will generate and what to name the files
+#we will mostly filter to remove any 'N's which dada2 cannot handle
+filt_path <- file.path("/rhome/tkurb001/shared/projects/LaBrea_Data/data/filtered")
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filtered.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filtered.fastq.gz"))
+
+#Using a maxEE of 2 and truncating when read quality falls below 10; usually I do trncQ=2 but trying higher here given poor quality ends
+#not truncating reads beyond based on quality bc we want to maintain most length due 
+#to ITS length variation
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, maxN=0, maxEE=c(2,2), truncQ=10, matchIDs =TRUE, rm.phix=TRUE, compress=TRUE, multithread=TRUE, verbose = TRUE)
+head(out)
+
+#get error rates
+errF <- learnErrors(filtFs, multithread=TRUE, randomize=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE, randomize=TRUE)
+
+#graph error rate estimates
+#plotErrors(errF, nominalQ=TRUE)
+#ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Plot_Errors.errF.png', plot = plotErrors(errF, nominalQ=TRUE), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+plotErrors(errR, nominalQ=TRUE)
+#ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Plot_Errors.errR.png', plot = plotErrors(errR, nominalQ=TRUE), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#checking if there is an output file (e.g. no missing files)
+exists <- file.exists(filtFs) & file.exists(filtRs)
+filtFs <- filtFs[exists]
+filtRs <- filtRs[exists]
+
+#get file names
+sample.names <- sapply(strsplit(basename(filtFs), "_F_filtered.fastq.gz"), `[`, 1) # Assumes filename = samplename_XXX.fastq.gz
+sample.namesR <- sapply(strsplit(basename(filtRs), "_R_filtered.fastq.gz"), `[`, 1) # Assumes filename = samplename_XXX.fastq.gz
+if(!identical(sample.names, sample.namesR)) stop("Forward and reverse files do not match.")
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+#Dereplication & Sample inference 
+mergers <- vector("list", length(sample.names))
+names(mergers) <- sample.names
+
+for(sam in sample.names) {
+  cat("Processing:", sam, "\n")
+  derepF <- derepFastq(filtFs[[sam]])
+  ddF <- dada(derepF, err=errF, multithread=TRUE)
+  derepR <- derepFastq(filtRs[[sam]])
+  ddR <- dada(derepR, err=errR, multithread=TRUE)
+  merger <- mergePairs(ddF, derepF, ddR, derepR, trimOverhang=TRUE)
+  mergers[[sam]] <- merger
+}
+rm(derepF); rm(derepR)
+
+# Make a sequence table 
+seqtab <- makeSequenceTable(mergers)
+
+#save table
+saveRDS(seqtab, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtab.dd2.merged.rds") 
+
+#get dimensions of table
+dim(seqtab)
+
+#Remove chimeras
+seqtab2 <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE)
+
+#get new dimensions 
+dim(seqtab2)
+
+#Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab2)))
+
+#percent seqs passed 
+sum(seqtab2)/sum(seqtab) #0.9987743
+
+#write to disk as R file
+saveRDS(seqtab2, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtab.dd2.merged_nochimera.rds")
+
+#write ASV table as csv file
+#write.csv(seqtab2,  "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtab.dd2.merged_nochimera.csv")
+
+#db https://doi.org/10.15156/BIO/1280160
+#assign taxonomy using UNITE fungal-only database with GWSS 18S/28S and hopefully ITS added
+#I find the euk-db version sometimes misidentifies fungi as plants 
+
+tax_v8.3f <- assignTaxonomy(seqtab2, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/database/sh_general_release_dynamic-ALL_16.10.2022/sh_general_release_dynamic-ALL_16.10.2022.fasta", multithread=TRUE, tryRC = TRUE)
+
+#save taxonomy as R file
+saveRDS(tax_v8.3f, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtab.dd2.merged_nochimera_tax_unite_s_16.10.2022_LBTP-BD.rds") 
+```
+
+```{R}
+#save taxonomy as csv file
+write.csv(tax_v8.3f, "/rhome/tkurb001/shared/projects/LaBrea_Data/data//results/seqtab.dd2.merged_nochimera_tax_unite_s_16.10.2022_LBTP-BD.csv")
+
+
+#but how many reads survived to the end?
+# set a little function
+getN <- function(x) sum(getUniques(x))
+
+# making a table
+summary_tab <- data.frame(row.names=sample.names, dada2_input=out[,1],
+               filtered=out[,2],merged=sapply(mergers, getN),
+               nonchim=rowSums(seqtab2),
+               final_perc_reads_retained=round(rowSums(seqtab2)/out[,1]*100, 1))
+
+summary_tab
+
+write.csv(summary_tab, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/summary_tab_10.19.2022_LBTP.csv")
+```
+
+
+### DADA2 using F read only
+```{R}
+
+#Path to data
+raw_data <- "/rhome/tkurb001/shared/projects/LaBrea_Data/data/primer_removed"
+list.files(raw_data)
+
+#Sort and get sample names
+fnFs <- sort(list.files(raw_data, pattern="R1.noprimers.fastq.gz"))
+sample.names <- sapply(strsplit(fnFs, "_ITS"), `[`, 1)
+
+#specify full paths to the data
+fnFs <- file.path(raw_data, fnFs)
+
+#Inspecting quality of data
+plotQualityProfile(fnFs[1:6]) #fwd reads for first 6 samples
+#ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Plot_Quality_Profile.fnFs.forward.png', plot = plotQualityProfile(fnFs[1:6]), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#specify where to save filtered data that we will generate and what to name the files
+#we will mostly filter to remove any 'N's which dada2 cannot handle
+F_filt_path <- file.path("/rhome/tkurb001/shared/projects/LaBrea_Data/data/F_filtered")
+filtFs <- file.path(F_filt_path, paste0(sample.names, "_F_filtered.fastq.gz"))
+
+#Using a maxEE of 2 and truncating the last 70 bp & when read quality falls below 10 
+#truncating reads based on quality bc we aren't merging so length variation isn't a factor
+out <- filterAndTrim(fnFs, filtFs, truncLen=180, maxN=0, maxEE=2, truncQ=10, rm.phix=TRUE, compress=TRUE, multithread=TRUE, verbose = TRUE)
+head(out)
+
+#get error rates
+errF <- learnErrors(filtFs, multithread=TRUE, randomize=TRUE)
+
+#graph error rate estimates
+plotErrors(errF, nominalQ=TRUE)
+#ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Plot_Errors.errF.forward.png', plot = plotErrors(errF, nominalQ=TRUE), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#checking if there is an output file (e.g. no missing files)
+exists <- file.exists(filtFs) 
+filtFs <- filtFs[exists]
+
+#get file names
+sample.names <- sapply(strsplit(basename(filtFs), "_F_filtered.fastq.gz"), `[`, 1) # Assumes filename = samplename_XXX.fastq.gz
+names(filtFs) <- sample.names
+
+#Dereplication & Sample inference 
+ddF <- vector("list", length(sample.names))
+names(ddF) <- sample.names
+
+for(sam in sample.names) {
+  cat("Processing:", sam, "\n")
+  derepF <- derepFastq(filtFs[[sam]])
+  ddF[[sam]] <- dada(derepF, err=errF, multithread=TRUE)
+}
+rm(derepF)
+
+# Make a sequence table 
+seqtabF <- makeSequenceTable(ddF)
+
+#save table
+saveRDS(seqtabF, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtabF.dd2.merged.rds") 
+
+#get dimensions of table
+dim(seqtabF)
+
+#Remove chimeras
+seqtabF2 <- removeBimeraDenovo(seqtabF, method="consensus", multithread=TRUE)
+
+#get new dimensions 
+dim(seqtabF2)
+
+#Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtabF2)))
+
+#percent seqs passed 
+sum(seqtabF2)/sum(seqtabF) #0.9922785 #0.9875595
+
+#write to disk as R file
+saveRDS(seqtabF2, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtabF.dd2.merged_nochimera.rds")
+
+#write ASV table as csv file
+write.csv(seqtabF2,  "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtabF.dd2.merged_nochimera.csv")
+
+#db https://doi.org/10.15156/BIO/1280160
+#assign taxonomy using UNITE database with GWSS 18S/28S and hopefully ITS added
+
+tax_v8.3f_F <- assignTaxonomy(seqtabF2, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/database/sh_general_release_dynamic-ALL_16.10.2022/sh_general_release_dynamic-ALL_16.10.2022.fasta", multithread=TRUE, tryRC = TRUE)
+
+#save taxonomy as R file
+saveRDS(tax_v8.3f_F, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtabF.dd2.merged_nochimera_tax_unite_s_16.10.2022_LBTP.rds") 
+
+#save taxonomy as csv file
+write.csv(tax_v8.3f_F, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtabF.dd2.merged_nochimera_tax_unite_s_16.10.2022_LBTP.csv")
+
+#but how many reads survived to the end?
+# set a little function
+getN <- function(x) sum(getUniques(x))
+
+# making a table
+summary_tab_F <- data.frame(row.names=sample.names, dada2_input=out[,1],
+               filtered=out[,2],merged=sapply(ddF, getN),
+               nonchim=rowSums(seqtabF2),
+               final_perc_reads_retained=round(rowSums(seqtabF2)/out[,1]*100, 1))
+
+summary_tab_F
+
+write.csv(summary_tab_F, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/summary_tab_Fonly_10.19.2022_LBTP.csv")
+```
+
+
+## Do merged or F reads perform better in terms of # remaining reads?
+```{R}
+summary_tab$sample <- rownames(summary_tab)
+summary_tab_F$sample <- rownames(summary_tab_F)
+
+summary_comp <- left_join(summary_tab, summary_tab_F, by="sample")
+
+summary_comp$summary_comp_diff <- summary_comp$final_perc_reads_retained.x - summary_comp$final_perc_reads_retained.y
+summary_comp
+```
+
+```{R}
+pdf(file="LBTP-BD_summary_comp.pdf", summary_comp, width = 25, height = 3)
+#F reads performed better - but this doesn't necessarily mean its the better choice
+ggplot(data=summary_comp, aes(x=sample, y=sort(summary_comp_diff))) + geom_point()
+
+dev.off()
+```
+
+I like to use phyloseq to import, manipulate & analyze microbiome/mycobiome data in R. If needed, I will export files from my phyloseq object for additional analyses in R with other packages (e.g. vegan for statistics) or outside of R (for example, sourcetracker2 in python). However, I have found that most R packages for microbiomes build on and/or work with the phyloseq package. Also the phyloseq package leverages ggplot2 plotting tools making plotting with in / exporting to tidyverse and plotting relatively easy.
+
+https://joey711.github.io/phyloseq/
+
+## Setting up phyloseq object
+
+#KEEPS RESETTING HERE FOR SOME REASON
+```{R}
+# Load mapping file, this is a file with your sample names and any metadata about the samples including information about collection, processing, etc
+mapping <- read.csv("/rhome/tkurb001/shared/projects/LaBrea_Data/data/metadata2.csv")
+
+
+#Merged dataset
+
+#load in the asv table and taxonomy table from dada2
+seqtab.nochimera <- readRDS('/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtab.dd2.merged_nochimera.rds')
+tax <- readRDS('/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtab.dd2.merged_nochimera_tax_unite_s_16.10.2022_LBTP-BD.rds')
+
+#Extract sequences from chimera free SV table:
+uniquesToFasta(seqtab.nochimera, '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtab.dd2.merged_nochimera.csv', ids = paste0("ITS_SV", seq(length(getSequences(seqtab.nochimera)))))
+
+
+#relabel asvs from sequence itself to names, here I am calling them 'ITS_SV#' 
+#since I plan to also have a '16S_SV#' 
+seqtab_final <- seqtab.nochimera
+colnames(seqtab_final) <- paste0("ITS_SV", 1:ncol(seqtab_final))
+
+tax_final <- tax
+rownames(tax_final) <- paste0("ITS_SV", 1:nrow(tax_final))
+
+#F only
+
+#load in the asv table and taxonomy table from dada2
+seqtab.nochimera.F <- readRDS('/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtabF.dd2.merged_nochimera.rds')
+taxF <- readRDS('/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtabF.dd2.merged_nochimera_tax_unite_s_16.10.2022_LBTP.rds')
+
+#Extract sequences from chimera free SV table:
+uniquesToFasta(seqtab.nochimera, '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/seqtabF.dd2.merged_nochimera.csv', ids = paste0("ITS_SV", seq(length(getSequences(seqtab.nochimera)))))
+
+
+#relabel asvs from sequence itself to names, here I am calling them 'ITS_SV#' 
+#since I plan to also have a '16S_SV#' 
+seqtab_final_F <- seqtab.nochimera.F
+colnames(seqtab_final_F) <- paste0("ITS_SV", 1:ncol(seqtab_final_F))
+
+tax_final_F <- taxF
+rownames(tax_final_F) <- paste0("ITS_SV", 1:nrow(tax_final_F))
+```
+
+```{R}
+## construct the phyloseq tables
+
+#Merged
+otu_table = otu_table(seqtab_final, taxa_are_rows=FALSE)
+
+row.names(mapping) <- mapping$SampleID
+mapping_file = sample_data(mapping)
+
+taxa_table = tax_table(tax_final)
+
+ps <- phyloseq(otu_table,mapping_file, taxa_table)
+ps
+
+#F only
+otu_table_F = otu_table(seqtab_final_F, taxa_are_rows=FALSE)
+
+taxa_table_F = tax_table(tax_final_F)
+
+ps_F <- phyloseq(otu_table_F,mapping_file, taxa_table_F)
+ps_F
+```
+
+```{R}
+# I want to visualize the tax tables for all
+ps_F@tax_table
+write.csv(ps_F@tax_table, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/phyloseq_forwardONLY_tax_table_10.20.2022_LBTP.csv")
+ps_F@otu_table
+write.csv(ps_F@otu_table, "/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/phyloseq_forwardONLY_otu_table_10.20.2022_LBTP.csv")
+```
+
+## Filtering dataset 
+
+```{R}
+#merged
+#removing an ASVs not assigned to the fungal kingdom
+ps_OF <- subset_taxa(ps, Kingdom =="k__Fungi")
+ps_OF
+
+#removing any samples with 0 reads
+ps_OF_nz <- prune_samples(sample_sums(ps_OF)>0, ps_OF)
+ps_OF_nz
+
+#f only
+#removing an ASVs not assigned to the fungal kingdom
+ps_F_OF <- subset_taxa(ps_F, Kingdom =="k__Fungi")
+ps_F_OF
+
+#removing any samples with 0 reads
+ps_F_OF_nz <- prune_samples(sample_sums(ps_F_OF)>0, ps_F_OF)
+ps_F_OF_nz
+```
+
+```{R}
+
+#merged
+#look at library size
+df <- as.data.frame(sample_data(ps_OF_nz)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps_OF_nz)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=SampleID)) + geom_point()
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Library_size.png', plot = ggplot(data=df, aes(x=Index, y=LibrarySize, color=Location)) + geom_point(), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#what is mean library size
+summary(df$LibrarySize)
+mean(df$LibrarySize) * 0.001 #16 reads
+
+#16.282
+#remove ASVs that are likely due to MiSeq bleed-through between runs (reported by Illumina to be 0.1% of reads)
+
+ps_OF_nz_rT = filter_taxa(ps_OF_nz, function(x) sum(x) > 25, TRUE)
+
+#F only
+#look at library size
+df <- as.data.frame(sample_data(ps_F_OF_nz)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps_F_OF_nz)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=SampleID)) + geom_point()
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Library_size.forward.png', plot = ggplot(data=df, aes(x=Index, y=LibrarySize, color=Location)) + geom_point(), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#what is mean library size
+summary(df$LibrarySize)
+
+#Min  1st Qu. Median  Mean  3rd Qu. Max.
+#5536 12300 17956 33253 54488 75700
+
+mean(df$LibrarySize) * 0.001 #39 reads
+#mean 33.25257
+
+#remove ASVs that are likely due to MiSeq bleed-through between runs (reported by Illumina to be 0.1% of reads)
+
+ps_F_OF_nz_rT = filter_taxa(ps_F_OF_nz, function(x) sum(x) > 32, TRUE)
+```
+
+### Fixing up taxonomy 
+
+```{R}
+#merged
+#fix ITS taxonomy
+df.ITS.tax <- data.frame(tax_table(ps_OF_nz_rT))
+
+#adjusting the tax table to have the last data hold the unclassified information
+df.ITS.tax %<>% 
+  mutate(Phylum = fct_explicit_na(Phylum, na_level = "p__Unclassified"), 
+         Class = fct_explicit_na(Class, na_level = "c__Unclassified"), 
+         Order = fct_explicit_na(Order, na_level = "o__Unclassified"), 
+         Family = fct_explicit_na(Family, na_level = "f__Unclassified"), 
+         Genus = fct_explicit_na(Genus, na_level = "g__Unclassified"), 
+         Species = fct_explicit_na(Species, na_level = "s__Unclassified"))
+
+tax.list <- c("Phylum", "Class", "Order", "Family", "Genus", "Species")
+tax.header <- c(Phylum = "p__", Class = "c__", Order = "o__", 
+                Family = "f__", Genus = "g__", Species = "s__")
+
+for (i in tax.list) {
+  names <- sapply(strsplit(as.character(df.ITS.tax[[i]]), as.character(tax.header[[i]])), `[`, 2)
+  df.ITS.tax[[i]] <- names 
+}
+
+#row.names(df.ITS.tax) <- row.names(tax_table(ps_OF_nz_rT))
+ITS.tax <- as.matrix(df.ITS.tax)
+
+tax_table(ps_OF_nz_rT) <- ITS.tax
+
+#F 
+#fix ITS taxonomy
+df.ITS.tax <- data.frame(tax_table(ps_F_OF_nz_rT))
+
+df.ITS.tax %<>% 
+  mutate(Phylum = fct_explicit_na(Phylum, na_level = "p__Unclassified"), 
+         Class = fct_explicit_na(Class, na_level = "c__Unclassified"), 
+         Order = fct_explicit_na(Order, na_level = "o__Unclassified"), 
+         Family = fct_explicit_na(Family, na_level = "f__Unclassified"), 
+         Genus = fct_explicit_na(Genus, na_level = "g__Unclassified"), 
+         Species = fct_explicit_na(Species, na_level = "s__Unclassified"))
+
+tax.list <- c("Phylum", "Class", "Order", "Family", "Genus", "Species")
+tax.header <- c(Phylum = "p__", Class = "c__", Order = "o__", 
+                Family = "f__", Genus = "g__", Species = "s__")
+
+for (i in tax.list) {
+  names <- sapply(strsplit(as.character(df.ITS.tax[[i]]), as.character(tax.header[[i]])), `[`, 2)
+  df.ITS.tax[[i]] <- names 
+}
+
+#row.names(df.ITS.tax) <- row.names(tax_table(ps_OF_nz_rT))
+ITS.tax <- as.matrix(df.ITS.tax)
+
+tax_table(ps_F_OF_nz_rT) <- ITS.tax
+```
+
+## Remove contaminants
+```{R}
+#two controls 
+#kit control
+#pcr negative
+
+kit <- subset_samples(ps_OF_nz_rT, Location != "PCR Negative")
+kit <- subset_samples(kit, Location != "Mock Community")
+
+sample_data(kit)$is.neg <- sample_data(kit)$Location == "Negative Control"
+contamdf.prev <- isContaminant(kit, method="prevalence", neg="is.neg",  threshold=.5)
+
+table(contamdf.prev$contaminant)
+contams <- row.names(contamdf.prev)[which(contamdf.prev$contaminant)]
+
+ps.pa <- transform_sample_counts(kit, function(abund) 1*(abund>0))
+ps.pa.neg <- prune_samples(sample_data(ps.pa)$Location == "Negative Control", ps.pa)
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$Location != "Negative Control", ps.pa)
+
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                      contaminant=contamdf.prev$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Remove_contaminants.png', plot = ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)"), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+pcr <- subset_samples(ps_OF_nz_rT, Location != "Negative Control")
+pcr <- subset_samples(pcr, Location != "Mock Community")
+
+sample_data(pcr)$is.neg <- sample_data(pcr)$Location == "PCR Negative"
+contamdf.prev.pcr <- isContaminant(pcr, method="prevalence", neg="is.neg",  threshold=.5)
+
+table(contamdf.prev.pcr$contaminant)
+contams.pcr <- row.names(contamdf.prev.pcr)[which(contamdf.prev.pcr$contaminant)]
+
+ps.pa.pcr <- transform_sample_counts(pcr, function(abund) 1*(abund>0))
+ps.pa.neg.pcr <- prune_samples(sample_data(ps.pa.pcr)$Location == "PCR Negative", ps.pa.pcr)
+ps.pa.pos.pcr <- prune_samples(sample_data(ps.pa.pcr)$Location != "PCR Negative", ps.pa.pcr)
+
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos.pcr), pa.neg=taxa_sums(ps.pa.neg.pcr),
+                      contaminant=contamdf.prev.pcr$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Remove_contaminants.forward.png', plot = ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)"), device = 'png', width = 16, height = 8, dpi = 300)
+
+```
+
+```{R}
+#remove contaminant ASVs
+all_taxa <- taxa_names(ps_OF_nz)
+newtaxa <- all_taxa[!(all_taxa %in% contams)]
+newtaxa2 <- newtaxa[!(newtaxa %in% contams.pcr)]
+
+
+ps_contam <- prune_taxa(newtaxa2, ps_OF_nz_rT)
+
+#remove control samples
+ps_contam_NC <- subset_samples(ps_contam, Location != "Mock Community")
+ps_contam_NC <- subset_samples(ps_contam_NC, Location != "PCR Negative")
+ps_contam_NC <- subset_samples(ps_contam_NC, Location != "Negative Control")
+
+ps_contam_NC
+# phyloseq-class experiment-level object
+# otu_table()   OTU Table:         [ 1021 taxa and 86 samples ]
+# sample_data() Sample Data:       [ 86 samples by 27 sample variables ]
+# tax_table()   Taxonomy Table:    [ 1021 taxa by 7 taxonomic ranks ]
+
+```
+
+
+## Remove contaminants -F 
+```{R}
+#two controls 
+#kit control
+#pcr negative
+
+kit <- subset_samples(ps_F_OF_nz_rT, Location != "PCR Negative")
+kit <- subset_samples(kit, Location != "Mock Community")
+
+sample_data(kit)$is.neg <- sample_data(kit)$Location == "Negative Control"
+contamdf.prev <- isContaminant(kit, method="prevalence", neg="is.neg",  threshold=.5)
+
+table(contamdf.prev$contaminant)
+contamsF <- row.names(contamdf.prev)[which(contamdf.prev$contaminant)]
+
+ps.pa <- transform_sample_counts(kit, function(abund) 1*(abund>0))
+ps.pa.neg <- prune_samples(sample_data(ps.pa)$Location == "Negative Control", ps.pa)
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$Location != "Negative Control", ps.pa)
+
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                      contaminant=contamdf.prev$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Remove_contaminants.forward.png', plot = ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)"), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+pcr <- subset_samples(ps_F_OF_nz_rT, Location != "Negative Control")
+pcr <- subset_samples(pcr, Location != "Mock Community")
+
+sample_data(pcr)$is.neg <- sample_data(pcr)$Location == "PCR Negative"
+contamdf.prev.pcr <- isContaminant(pcr, method="prevalence", neg="is.neg",  threshold=.5)
+
+table(contamdf.prev.pcr$contaminant)
+contams.pcr.F <- row.names(contamdf.prev.pcr)[which(contamdf.prev.pcr$contaminant)]
+
+ps.pa.pcr <- transform_sample_counts(pcr, function(abund) 1*(abund>0))
+ps.pa.neg.pcr <- prune_samples(sample_data(ps.pa.pcr)$Location == "PCR Negative", ps.pa.pcr)
+ps.pa.pos.pcr <- prune_samples(sample_data(ps.pa.pcr)$Location != "PCR Negative", ps.pa.pcr)
+
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos.pcr), pa.neg=taxa_sums(ps.pa.neg.pcr),
+                      contaminant=contamdf.prev.pcr$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+```
+
+```{R}
+#remove contaminant ASVs
+all_taxa <- taxa_names(ps_F_OF_nz)
+newtaxa <- all_taxa[!(all_taxa %in% contamsF)]
+newtaxa2 <- newtaxa[!(newtaxa %in% contams.pcr.F)]
+
+
+ps_contamF <- prune_taxa(newtaxa2, ps_F_OF_nz_rT)
+
+#remove control samples
+ps_contam_NC_F <- subset_samples(ps_contamF, Location != "Mock Community")
+ps_contam_NC_F <- subset_samples(ps_contam_NC_F, Location != "PCR Negative")
+ps_contam_NC_F <- subset_samples(ps_contam_NC_F, Location != "Negative Control")
+
+ps_contam_NC_F <- prune_samples(sample_sums(ps_contam_NC_F)>50, ps_contam_NC_F)
+
+
+ps_contam_NC_F 
+# phyloseq-class experiment-level object
+# otu_table()   OTU Table:         [ 1204 taxa and 86 samples ]
+# sample_data() Sample Data:       [ 86 samples by 27 sample variables ]
+# tax_table()   Taxonomy Table:    [ 1204 taxa by 7 taxonomic ranks ]
+```
+
+
+## Rarefaction
+Another choice! To rarefy or not - some argue its throwing away data, while some suggest this is still best method of normalization for microbiome data given the sensitivity of the statistics and metrics used in microbial ecology to different sample sizes/depths. Whatever you choose, make sure to justify to yourself and describe in any manuscript. 
+
+relevant info:
+https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1003531
+https://www.nature.com/articles/s41598-021-01636-1
+https://riffomonas.org/code_club/2022-02-21-null-model
+
+Regardless of if you decide to "rarefy" - it is still a good idea to look at 'rarefaction' curves to see how your samples look - does your data approach an asymptote as it should if you are sampling the whole community? Or does it look like a line that goes up and up indicating that you have under-sampled the community? This is important for interpretation of results, particulary for rare taxa.   
+
+## Investigation possible rarefaction numbers
+### Custom script from phyloseq_extended
+https://github.com/mahendra-mariadassou/phyloseq-extended/blob/master/R/richness.R
+
+```{R} 
+
+#defining function that is the wrapper
+ggrare <- function(physeq, step = 10, label = NULL, color = NULL, plot = TRUE, parallel = FALSE, se = TRUE) {
+  ## Args:
+  ## - physeq: phyloseq class object, from which abundance data are extracted
+  ## - step: Step size for sample size in rarefaction curves
+  ## - label: Default `NULL`. Character string. The name of the variable
+  ##          to map to text labels on the plot. Similar to color option
+  ##          but for plotting text.
+  ## - color: (Optional). Default ‘NULL’. Character string. The name of the
+  ##          variable to map to colors in the plot. This can be a sample
+  ##          variable (among the set returned by
+  ##          ‘sample_variables(physeq)’ ) or taxonomic rank (among the set
+  ##          returned by ‘rank_names(physeq)’).
+  ##
+  ##          Finally, The color scheme is chosen automatically by
+  ##          ‘link{ggplot}’, but it can be modified afterward with an
+  ##          additional layer using ‘scale_color_manual’.
+  ## - color: Default `NULL`. Character string. The name of the variable
+  ##          to map to text labels on the plot. Similar to color option
+  ##          but for plotting text.
+  ## - plot:  Logical, should the graphic be plotted.
+  ## - parallel: should rarefaction be parallelized (using parallel framework)
+  ## - se:    Default TRUE. Logical. Should standard errors be computed. 
+  ## require vegan
+  x <- as(otu_table(physeq), "matrix")
+  if (taxa_are_rows(physeq)) { x <- t(x) }
+  
+  ## This script is adapted from vegan `rarecurve` function
+  tot <- rowSums(x)
+  S <- rowSums(x > 0)
+  nr <- nrow(x)
+  
+  rarefun <- function(i) {
+    #cat(paste("rarefying sample", rownames(x)[i]), sep = "\n")
+    n <- seq(1, tot[i], by = step)
+    if (n[length(n)] != tot[i]) {
+      n <- c(n, tot[i])
+    }
+    y <- rarefy(x[i, ,drop = FALSE], n, se = se)
+    if (nrow(y) != 1) {
+      rownames(y) <- c(".S", ".se")
+      return(data.frame(t(y), Size = n, Sample = rownames(x)[i]))
+    } else {
+      return(data.frame(.S = y[1, ], Size = n, Sample = rownames(x)[i]))
+    }
+  }
+  if (parallel) {
+    out <- mclapply(seq_len(nr), rarefun, mc.preschedule = FALSE)
+  } else {
+    out <- lapply(seq_len(nr), rarefun)
+  }
+  df <- do.call(rbind, out)
+  
+  ## Get sample data 
+  if (!is.null(sample_data(physeq, FALSE))) {
+    sdf <- as(sample_data(physeq), "data.frame")
+    sdf$Sample <- rownames(sdf)
+    data <- merge(df, sdf, by = "Sample")
+    labels <- data.frame(x = tot, y = S, Sample = rownames(x))
+    labels <- merge(labels, sdf, by = "Sample")
+  }
+  
+  ## Add, any custom-supplied plot-mapped variables
+  if( length(color) > 1 ){
+    data$color <- color
+    names(data)[names(data)=="color"] <- deparse(substitute(color))
+    color <- deparse(substitute(color))
+  }
+  if( length(label) > 1 ){
+    labels$label <- label
+    names(labels)[names(labels)=="label"] <- deparse(substitute(label))
+    label <- deparse(substitute(label))
+  }
+  
+  p <- ggplot(data = data, aes_string(x = "Size", y = ".S", group = "Sample", color = color))
+  p <- p + labs(x = "Sample Size", y = "Species Richness")
+  if (!is.null(label)) {
+    p <- p + geom_text(data = labels, aes_string(x = "x", y = "y", label = label, color = color),
+                       size = 4, hjust = 0)
+  }
+  p <- p + geom_line()
+  if (se) { ## add standard error if available
+    p <- p + geom_ribbon(aes_string(ymin = ".S - .se", ymax = ".S + .se", color = NULL, fill = color), alpha = 0.2)
+  }
+  if (plot) {
+    plot(p)
+  }
+  invisible(p)
+}
+```
+
+### Assessing rarefaction curves & library size
+
+
+```{R}
+
+#Merged
+#plotting rarefaction curves, using step = 1000 reads
+p = ggrare(ps_contam_NC, step = 100, label = "SampleID", color = "SampleID")  
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rarefraction_curve_library.png', plot  = ggrare(ps_contam_NC, step = 100, label = "SampleID", color = "SampleID"), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#drawing cut-off line at 10000 reads
+p + geom_vline(xintercept = 10000, linetype="dashed")
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rarefraction_curve_library_10000.png', plot  = ggrare(ps_contam_NC, step = 100, label = "SampleID", color = "SampleID") + geom_vline(xintercept = 10000, linetype="dashed"), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#drawing cut-off line at 5000 reads
+p + geom_vline(xintercept = 5000, linetype="dashed")
+# 5000 reads might be a good middle ground based on rarefaction curves
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rarefraction_curve_library_5000.png', plot  = ggrare(ps_contam_NC, step = 100, label = "SampleID", color = "SampleID") + geom_vline(xintercept = 5000, linetype="dashed"), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#drawing cut-off line at 1000 reads
+p + geom_vline(xintercept = 1000, linetype="dashed")
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rarefraction_curve_library_1000.png', plot  = ggrare(ps_contam_NC, step = 100, label = "SampleID", color = "SampleID") + geom_vline(xintercept = 1000, linetype="dashed"), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+## Look at library size
+df <- as.data.frame(sample_data(ps_contam_NC)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps_contam_NC)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=SampleID)) + geom_point() + geom_hline(yintercept = 1000, linetype="dashed")  + theme(text = element_text(size=18))
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Library_FILT.png', plot  = ggplot(data=df, aes(x=Index, y=LibrarySize, color=SampleID)) + geom_point() + geom_hline(yintercept = 1000, linetype="dashed")  + theme(text = element_text(size=18)), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+summary(df$LibrarySize)
+# Given that median is 10018, first qu. is ~4700, might make more sense to do ~4000 reads 
+hist(df$LibrarySize, breaks = 50) #right skewed
+
+#log10(1) = 0, log10(10) = 1, log10(100) = 2, log10(1000) = 3, so rarefy at 1000 line would be:
+ggplot(data=df, aes(x=log10(LibrarySize), fill=SampleID)) + geom_histogram(binwidth  =1, position= "dodge", col="black") + theme(text = element_text(size=18))  + ylab("Frequency of samples") + xlab(expression(paste("lo", g[10]," transformed read counts")))+scale_x_continuous(breaks=c(0,1,2,3,4,5)) + geom_vline(xintercept = 3.5, linetype="solid", col="#EF7F4FFF", size =2)
+```
+
+```{R}
+#F
+
+#plotting rarefaction curves, using step = 1000 reads
+p = ggrare(ps_contam_NC_F, step = 100, label = "SampleID", color = "Location")  
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rarefraction_FOR.png', plot  = ggrare(ps_contam_NC_F, step = 100, label = "SampleID", color = "SampleID"), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#drawing cut-off line at 10000 reads
+p + geom_vline(xintercept = 10000, linetype="dashed")
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rarefraction_FOR.10000.png', plot  = ggrare(ps_contam_NC_F, step = 100, label = "SampleID", color = "SampleID") + geom_vline(xintercept = 10000, linetype="dashed"), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#drawing cut-off line at 5000 reads
+p + geom_vline(xintercept = 5000, linetype="dashed")
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rarefraction_FOR.5000.png', plot  = ggrare(ps_contam_NC_F, step = 100, label = "SampleID", color = "SampleID") + geom_vline(xintercept = 5000, linetype="dashed"), device = 'png', width = 16, height = 8, dpi = 300)
+# 5000 reads might be a good middle ground based on rarefaction curves
+```
+
+```{R}
+#drawing cut-off line at 1000 reads
+p + geom_vline(xintercept = 1000, linetype="dashed")
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rarefraction_FOR.1000.png', plot  = ggrare(ps_contam_NC_F, step = 100, label = "SampleID", color = "SampleID") + geom_vline(xintercept = 1000, linetype="dashed"), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+## Look at library size
+df <- as.data.frame(sample_data(ps_contam_NC_F)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps_contam_NC_F)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=SampleID)) + geom_point() + geom_hline(yintercept = 1000, linetype="dashed")  + theme(text = element_text(size=18))
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Library_F_FILT.png', plot  = ggplot(data=df, aes(x=Index, y=LibrarySize, color=SampleID)) + geom_point() + geom_hline(yintercept = 1000, linetype="dashed")  + theme(text = element_text(size=18)), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+summary(df$LibrarySize)
+# Given that median is ~9000, 1st qu ~4300 might make more sense to do ~4000 reads if needed? And try to use proportions / unrarefied data where can
+
+hist(df$LibrarySize, breaks = 50) #right skewed
+
+ggplot(data=df, aes(x=log10(LibrarySize), fill=SampleID)) + geom_histogram(binwidth  =1, position= "dodge", col="black") + theme(text = element_text(size=18))  + ylab("Frequency of samples") + xlab(expression(paste("lo", g[10]," transformed read counts")))+scale_x_continuous(breaks=c(0,1,2,3,4,5)) + geom_vline(xintercept = 3.5, linetype="solid", col="#EF7F4FFF", size =2)
+```
+
+## Quick Examples 
+
+#Not related to my work
+#```{R}
+#first subset to remove samples not important to our current investigation
+#locations - include only wild animals
+ps_contam_NC_wild <- subset_samples(ps_contam_NC, Location != "Captive")
+ps_contam_NC_F_wild <- subset_samples(ps_contam_NC_F, Location != "Captive")
+#```
+
+## Alpha Diversity
+```{R}
+
+#make a factor
+sample_data(ps_contam_NC)$SampleID <- factor(sample_data(ps_contam_NC)$SampleID)
+
+sample_data(ps_contam_NC_F)$SampleID <- factor(sample_data(ps_contam_NC_F)$SampleID)
+
+## Stats ##
+
+#merged
+alpha_its <- estimate_richness(ps_contam_NC, measures = c("Shannon"))
+alpha_its <- cbind(alpha_its, sample_data(ps_contam_NC))
+
+# kruskal tests overall to look at sample type
+kruskal_test(Shannon ~ SampleID, distribution = approximate(nresample = 9999), 
+    data = alpha_its)
+#not sig #chi-squared = 6, p-value = 1
+
+#post hoc (if it was sig)
+#dunnTest(Shannon ~ Location, data = alpha_its, method = "bh")
+
+#F
+alpha_itsF <- estimate_richness(ps_contam_NC_F, measures = c("Shannon"))
+alpha_itsF <- cbind(alpha_itsF, sample_data(ps_contam_NC_F))
+
+# kruskal tests overall to look at sample type
+kruskal_test(Shannon ~ SampleID, distribution = approximate(nresample = 9999), 
+    data = alpha_itsF)
+#not sig #chi-squared = 6, p-value = 1
+
+#post hoc (if it was sig)
+#dunnTest(Shannon ~ Location, data = alpha_itsF, method = "bh")
+```
+
+```{R}
+
+#plotting
+grouped_alpha_its <- group_by(alpha_its, SampleID)
+avgs_alpha_its <- summarise(grouped_alpha_its, mean_S = mean(Shannon), 
+    sd_S = sd(Shannon), se_S = se(Shannon))
+
+alpha_its_shan = ggplot(avgs_alpha_its, aes(x = SampleID, y = (mean_S), 
+    fill = SampleID)) + geom_bar(stat = "identity", 
+    position = position_dodge()) + geom_errorbar(aes(ymin = (mean_S - 
+    se_S), ymax = (mean_S + se_S)), width = 0.4, position = position_dodge(0.9)) + theme(axis.text.x = element_text(angle = -90, 
+    hjust = 0, vjust = 0.5))+ ylab("Mean Shannon Diversity") + 
+    theme(text = element_text(size = 24)) + theme(legend.position = "none")
+
+alpha_its_shan
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Alpha.png', plot  = ggplot(avgs_alpha_its, aes(x = SampleID, y = (mean_S), 
+    fill = SampleID)) + geom_bar(stat = "identity", 
+    position = position_dodge()) + geom_errorbar(aes(ymin = (mean_S - 
+    se_S), ymax = (mean_S + se_S)), width = 0.4, position = position_dodge(0.9)) + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5))+ ylab("Mean Shannon Diversity") + theme(text = element_text(size = 24)) + theme(legend.position = "none"), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#F
+grouped_alpha_itsF <- group_by(alpha_itsF, SampleID)
+avgs_alpha_itsF <- summarise(grouped_alpha_itsF, mean_S = mean(Shannon), 
+    sd_S = sd(Shannon), se_S = se(Shannon))
+
+alpha_its_shanF = ggplot(avgs_alpha_itsF, aes(x = SampleID, y = (mean_S), 
+    fill = SampleID)) + geom_bar(stat = "identity", 
+    position = position_dodge()) + geom_errorbar(aes(ymin = (mean_S - 
+    se_S), ymax = (mean_S + se_S)), width = 0.4, position = position_dodge(0.9)) + theme(axis.text.x = element_text(angle = -90, 
+    hjust = 0, vjust = 0.5))+ ylab("Mean Shannon Diversity") + 
+    theme(text = element_text(size = 24)) + theme(legend.position = "none")
+
+alpha_its_shanF
+
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Alpha_F.png', plot  = ggplot(avgs_alpha_itsF, aes(x = SampleID, y = (mean_S), 
+    fill = SampleID)) + geom_bar(stat = "identity", 
+    position = position_dodge()) + geom_errorbar(aes(ymin = (mean_S - 
+    se_S), ymax = (mean_S + se_S)), width = 0.4, position = position_dodge(0.9)) + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5))+ ylab("Mean Shannon Diversity") + theme(text = element_text(size = 24)) + theme(legend.position = "none"), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+comb_alpha <- alpha_its_shan + alpha_its_shanF
+comb_alpha
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Comb_Alpha.png', plot  = comb_alpha, device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+## Beta Diversity
+
+Lots of choices of metric, normalization, etc here - but I am just going to show one as an example.
+```{R}
+
+#ps_contam_NC <- data.frame(ps_contam_NC)
+
+#Hellinger transformation of counts
+#ps_contam_NC.hell <- transform(ps_contam_NC, 'hellinger')
+#ps_contam_NC.F.hell <- transform(ps_contam_NC_F, 'hellinger')
+
+#Bray-Curtis transformation of counts
+its_bray <- ordinate(
+  physeq = ps_contam_NC, 
+  method = "PCoA", 
+  distance = "bray")
+
+#Bray-Curtis transformation of counts
+its_bray_F <- ordinate(
+  physeq = ps_contam_NC_F, 
+  method = "PCoA", 
+  distance = "bray")
+
+
+#Add extra shapes see here https://stackoverflow.com/questions/16813278/cycling-through-point-shapes-when-more-than-6-factor-levels
+#Bray-Curtis transformation of counts
+its_bray_plot_loc = plot_ordination(
+  physeq = ps_contam_NC,
+  ordination = its_bray,
+  shape = "SampleID",
+  color = "SampleID") 
+its_bray_plot_loc = its_bray_plot_loc + geom_point(size = 2) + theme(text = element_text(size=8))  + scale_colour_viridis_d(option = "plasma") + labs(color ="SampleID", shape="SampleID")  + scale_shape_manual(values = c(4,8,15,16,17,18,21))
+its_bray_plot_loc
+
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Beta_PCA_Bray-Curtis.png', plot  = its_bray_plot_loc + geom_point(size = 2) + theme(text = element_text(size=8))  + scale_colour_viridis_d(option = "plasma") + labs(color ="SampleID", shape="SampleID"), device = 'png', width = 16, height = 8, dpi = 300) + scale_shape_manual(values = c(4,8,15,16,17,18,21))
+```
+
+```{R}
+#Bray-Curtis transformation of counts
+#add extra shapes see here https://stackoverflow.com/questions/16813278/cycling-through-point-shapes-when-more-than-6-factor-levels
+its_bray_plot_Floc = plot_ordination(
+  physeq = ps_contam_NC_F,
+  ordination = its_bray_F,
+  shape = "SampleID",
+  color = "SampleID") 
+its_bray_plot_Floc = its_bray_plot_Floc + geom_point(size = 2) + theme(text = element_text(size=8))  + scale_colour_viridis_d(option = "plasma") + labs(color ="SampleID", shape="SampleID") + scale_shape_manual(values = c(4,8,15,16,17,18,21))
+its_bray_plot_Floc
+
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Beta_PCA_F-Bray-Curtis.png', plot  = its_bray_plot_Floc + geom_point(size = 2) + theme(text = element_text(size=8))  + scale_colour_viridis_d(option = "plasma") + labs(color ="SampleID", shape="SampleID"), device = 'png', width = 16, height = 8, dpi = 300) + scale_shape_manual(values = c(4,8,15,16,17,18,21))
+```
+
+```{R}
+#all plots
+its_bray_plot_loc + its_bray_plot_Floc + plot_annotation(tag_levels = 'A') + plot_layout(guides = 'collect')
+
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Bray-Curtis.location.compare.pdf', plot = last_plot(), device = 'pdf', width = 16, height = 8, dpi = 300)
+
+```
+#Stats don't seem to make sense with this dataset, and that's fine as this was only an attempt at understanding the organisms here. So running steps below gave us nothing - which is OKAY.
+
+
+```{R}
+#beta div stats
+Dist.its.bray <- phyloseq::distance(ps_contam_NC, method = "bray", type = "samples")
+
+#here we will use an example with a model of one variable, but more complex models can and should be explored
+#adonis tests for differences in centroid and/or dispersion
+adonis2(Dist.its.bray ~ SampleID, as(sample_data(ps_contam_NC), "data.frame"), permutations = 9999)
+
+#no posthoc adonis test so need to do pair-wise
+
+#adonis.pair(Dist.its.bray, as.factor(as(sample_data(ps_contam_NC), "data.frame")[,"SampleID"]), nper = 9999, corr.method = "BH")
+
+
+#betadisper tests for dispersion only
+disp_dist <- betadisper(Dist.its.bray, as(sample_data(ps_contam_NC), "data.frame")[,"SampleID"])
+permutest(disp_dist, permutations = 9999)
+#sig
+
+#post hoc test to see which pairs driving
+TukeyHSD(disp_dist)
+```
+
+
+## relative abundance 
+```{R}
+#relative abundance
+
+ps.RA <- transform_sample_counts(ps_contam_NC,  function(x) x/sum(x))
+
+ps.RA.gen <- tax_glom(ps.RA, taxrank="Genus", NArm=TRUE)
+ps.RA.filt = filter_taxa(ps.RA.gen, function(x) mean(x) > 0.01, TRUE)
+
+df_ps.RA.filt <- psmelt(ps.RA.filt)
+
+grouped <- group_by(df_ps.RA.filt, Location, Phylum, Class, Order,Family,Genus)
+
+avgs_grouped <- summarise(grouped, mean = 100 * mean(Abundance), 
+                          sd = 100 * sd(Abundance), se = 100 * se(Abundance))
+
+#angle and more! https://stackoverflow.com/questions/1330989/rotating-and-spacing-axis-labels-in-ggplot2
+
+plot = ggplot(avgs_grouped, aes(x = Genus, y = (mean), fill = Phylum)) + geom_bar(stat = "identity", position = "stack") + facet_wrap(~Location) + theme(axis.text.x=element_text(angle = -45, hjust = 0))
+plot
+
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rel_abundance_Phylum2.png', plot  = ggplot(avgs_grouped, aes(x = Genus, y = (mean), fill = Phylum)) + theme(axis.text.x=element_text(angle = -45, hjust = 0)) + geom_bar(stat = "identity", position = "stack") + facet_wrap(~Location), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+#Knit issue https://github.com/rstudio/rmarkdown/issues/1285
+
+```{R}
+plot = plot + theme(axis.text.x = element_text(angle = -70, hjust = 0, vjust = 0.5), text = element_text(size = 18)) + 
+  ylab("Mean Relative Abundance") + xlab("Genus") + theme(axis.text.x=element_text(angle = -45, hjust = 0))
+plot
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rel_abun_nice.png', plot  = plot + theme(axis.text.x = element_text(angle = -70, hjust = 0, vjust = 0.5), text = element_text(size = 18)) + 
+  ylab("Mean Relative Abundance") + xlab("Genus") + theme(axis.text.x=element_text(angle = -45, hjust = 0)), device = 'png', width = 16, height = 8, dpi = 300)
+```
+
+```{R}
+#relative abundance, F
+
+ps.RA <- transform_sample_counts(ps_contam_NC_F,  function(x) x/sum(x))
+
+ps.RA.gen <- tax_glom(ps.RA, taxrank="Genus", NArm=TRUE)
+ps.RA.filt = filter_taxa(ps.RA.gen, function(x) mean(x) > 0.01, TRUE)
+
+df_ps.RA.filt <- psmelt(ps.RA.filt)
+
+groupedF <- group_by(df_ps.RA.filt, Location, Phylum, Class, Order,Family,Genus)
+
+avgs_groupedF <- summarise(groupedF, mean = 100 * mean(Abundance), 
+                          sd = 100 * sd(Abundance), se = 100 * se(Abundance))
+
+plotF = ggplot(avgs_groupedF, aes(x = Genus, y = (mean), fill = Phylum)) + 
+  geom_bar(stat = "identity", position = "stack") + facet_wrap(~Location) + theme(axis.text.x=element_text(angle = -45, hjust = 0))
+plotF
+
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Relative_abundance_F.png', plot  = ggplot(avgs_groupedF, aes(x = Genus, y = (mean), fill = Phylum)) + geom_bar(stat = "identity", position = "stack") + facet_wrap(~Location) , device = 'png', width = 16, height = 8, dpi = 300) + theme(axis.text.x=element_text(angle = -45, hjust = 0))
+```
+
+```{R}
+plotF = plotF + theme(axis.text.x = element_text(angle = -70, hjust = 0, vjust = 0.5), text = element_text(size = 18)) + 
+  ylab("Mean Relative Abundance") + xlab("Genus") + theme(axis.text.x=element_text(angle = -45, hjust = 0))
+plotF
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rel_abun_F_NICE.png', plot  = plotF + theme(axis.text.x = element_text(angle = -70, hjust = 0, vjust = 0.5), text = element_text(size = 18)) +  ylab("Mean Relative Abundance") + xlab("Genus"), device = 'png', width = 16, height = 8, dpi = 300) + theme(axis.text.x=element_text(angle = -45, hjust = 0))
+```
+
+```{R}
+#all plots
+plotFULL<- plot + plotF + plot_annotation(tag_levels = 'A') + plot_layout(guides = 'collect')
+
+ggsave(filename = '/rhome/tkurb001/shared/projects/LaBrea_Data/data/results/plots/Rel_abundance_compared2.png', plot  = plotFULL + plot_annotation(tag_levels = 'A') + plot_layout(guides = 'collect'), device = 'png', width = 16, height = 8, dpi = 300)
+```
